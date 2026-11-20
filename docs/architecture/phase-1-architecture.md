@@ -22,10 +22,10 @@ Priority order (owner's): gameplay quality → stable multiplayer → responsive
 |---|---|---|---|
 | Render layer | (a) React Three Fiber for the whole scene · (b) **imperative Three.js engine + React only for UI/HUD** | **(b)** | A game loop needs full control of frame timing, pooling and allocation. R3F's reconciler adds GC pressure and indirection in the hot path. React stays where it shines: menus, HUD, inventory, settings. |
 | Renderer backend | (a) `WebGLRenderer` + GLSL · (b) **`WebGPURenderer` + TSL node materials (auto-falls back to WebGL2)** | **(b), validated by a spike** | Writing materials in TSL once runs on both WebGPU and WebGL2. Starting on GLSL means rewriting every material later. Risk: the WebGL2 backend of `WebGPURenderer` can lag `WebGLRenderer` in performance. **Phase 3, week 1 spike** benchmarks both on the test map. If WebGL2-backend perf misses budget by >20%, fall back to (a) behind the same `RendererBackend` interface. |
-| Physics | (a) custom collision · (b) cannon-es · (c) **Rapier 3D, deterministic build, on both client and server** | **(c)** | Same WASM binary on both ends gives bit-identical results, which makes reconciliation cheap and exact. Built-in kinematic character controller, heightfields, fast raycasts. |
-| Transport | (a) **WebSocket now, behind a `Transport` interface** · (b) WebTransport/datagrams now | **(a)** | WebSocket works everywhere and through every proxy. TCP head-of-line blocking hurts under packet loss, so the protocol is designed for unreliable delivery (redundant inputs, delta snapshots vs last ack) and WebTransport drops in later (Phase 8+) without protocol changes. |
+| Physics | (a) custom collision · (b) cannon-es · (c) **Rapier 3D, deterministic build, on both client and server** | **(c)** | The same WASM binary gives identical results from identical state and inputs. Client prediction only moves the local player against **static** geometry, which is identical on both ends, so mismatches are rare and come from server-only causes (player collisions, hits). game-core avoids `Math.sin/cos/pow/exp` in sim paths (those are not bit-exact across JS engines) and uses its own deterministic math module. Built-in kinematic character controller, heightfields, fast raycasts. |
+| Transport | (a) **WebSocket now, behind a `Transport` interface** · (b) WebTransport/datagrams now | **(a)** | WebSocket works everywhere and through every proxy. It is TCP, so a lost packet stalls everything behind it (head-of-line blocking), and nothing in the protocol can remove that over WebSocket. The protocol is still shaped for unreliable delivery (redundant inputs, delta snapshots vs last ack), so WebTransport datagrams can drop in behind `Transport` (evaluated Phase 8, earlier if Phase 5 chaos tests show stalls) without protocol changes. |
 | Wire format | (a) JSON everywhere · (b) protobuf/flatbuffers · (c) **JSON+zod for control messages, hand-rolled bit-packed binary for the hot path** | **(c)** | Control traffic (join, chat, inventory actions) is rare: readable and schema-validated. Inputs and snapshots are 20–60 Hz: binary with quantization, delta compression and bounds-checked decoding. No codegen toolchain. |
-| Server concurrency | (a) all matches on one event loop · (b) **one match per `worker_thread`, N workers per process** | **(b)** | A heavy match can't stall another. GC pauses are isolated. Slice runs 1 worker. |
+| Server concurrency | (a) all matches on one event loop · (b) host relays sockets to `worker_thread`s · (c) **one match per `worker_thread`, each worker listening on its own port** | **(c)** | Node can't hand a socket to a `worker_thread`, so with (b) the host's event loop would carry every match's traffic. In (c) each worker owns its WebSocket server on its own port and the match ticket names that URL, so a heavy match or a GC pause stays inside its worker. The slice runs 1 worker. |
 | Hit detection | (a) client-reported hits, server sanity check · (b) **server-simulated projectiles with lag compensation** | **(b)** | Owner's rule: never trust client hits. Bullet velocity and drop are part of the design, so hitscan is not enough. |
 | Matchmaking store | (a) Redis from day one · (b) **in-memory queue behind `MatchQueue` interface, Redis adapter when the API runs >1 instance** | **(b)** | Owner: "Redis when justified". It becomes justified at horizontal scale (Phase 8). The interface is fixed now. |
 | Accounts in slice | (a) full email/password · (b) **guest accounts (device-bound) persisted in Postgres, upgradeable later** | **(b)** | Real persistence and auth tokens from the start. Password/OAuth flows come in Phase 7 on the same tables. |
@@ -53,7 +53,7 @@ flowchart LR
   WEB -- HTTPS GET --> ASSETS
   API -- SQL --> PG
   API -. queue/presence .-> RD
-  API -- allocate match (internal HTTP) --> GS
+  API -- allocate match (internal HTTP to host) --> GS
   GS -- report results (internal HTTP, signed) --> API
 ```
 
@@ -103,7 +103,9 @@ Rules:
 - Graphics presets (Low/Medium/High/Ultra) are data in `@br/game-config`. A capability probe at boot (WebGPU availability, max texture size, a short GPU benchmark) picks the default. Dynamic resolution scales the render target between 0.6× and 1.0× to hold the frame-time budget.
 
 ### Controls (PC-first, rebindable)
-Default map exactly as specified (WASD, mouse, LMB fire, RMB ADS, Shift, C, Z, Space, R, F, Tab, M, 1/2/3, Q/E, V, Esc). Implemented as **actions**, not keys. `input/` resolves physical input → action → per-tick `InputFrame`. Hold/toggle per action, sensitivity (hip/ADS/scope separately), profiles saved to the server settings table. Raw mouse deltas come via Pointer Lock with `unadjustedMovement: true` where supported, so OS acceleration is off. Gamepad (Phase 7) and touch (Phase 7) are additional input sources for the same action map.
+Default map exactly as specified (WASD, mouse, LMB fire, RMB ADS, Shift, C, Z, Space, R, F, Tab, M, 1/2/3, Q/E, V, Esc). Implemented as **actions**, not keys. `input/` resolves physical input → action → per-tick `InputFrame`. Hold/toggle per action, sensitivity (hip/ADS/scope separately), profiles saved to the server settings table. Raw mouse deltas come via Pointer Lock with `unadjustedMovement: true`, so OS acceleration is off. Only Chromium supports it, and other browsers reject the request, so the code catches the rejection and retries without the option.
+
+**Supported browsers (slice):** latest Chrome/Edge, Firefox and Safari on desktop. The determinism test runs in Node + Chromium + Firefox + WebKit via Playwright. Gamepad (Phase 7) and touch (Phase 7) are additional input sources for the same action map.
 
 ---
 
@@ -117,10 +119,10 @@ Modules: `auth`, `profiles`, `settings`, `matchmaking`, `allocation`, `results`,
 - Validation: every route has a JSON schema (zod → Fastify). Rate limits per IP and per user. Structured logs (pino) with request IDs.
 
 ### `apps/game-server`
-- One **host process** exposes WSS plus an internal HTTP control API (create match, health, capacity, drain).
-- Each match runs in a **worker thread** owning a `MatchInstance`: Rapier world, `game-core` simulation, network sessions.
-- The host verifies the match ticket's signature with the API's **public key** (no DB call, no shared secret) and routes the socket to the right worker. Each nonce is used once.
-- Fixed tick (default **30 Hz**, configurable up to 60). Tick-time metrics are recorded per match. Graceful drain: on SIGTERM, stop accepting new matches, let running ones finish (with a max time), then exit.
+- One **host process** runs only the internal HTTP control API (create match, health, capacity, drain) and supervises workers. It carries no game traffic.
+- Each match runs in a **worker thread** that owns a `MatchInstance` (Rapier world, `game-core` simulation, network sessions) and **its own WebSocket server on a port from a configured range**. Allocation returns that worker's public URL, and the ticket carries it. In the VPS profile nginx maps `/play/<slot>` to the slot's port. In cloud profiles each worker port is exposed directly.
+- The worker verifies the match ticket's signature with the API's **public key** (no DB call, no shared secret) and checks the ticket's `matchId` is its own. Each nonce is used once.
+- **Timing:** the simulation always steps at a fixed **dt = 1/60 s** on both client and server, and one `InputFrame` = one sim step. The server's **network tick is 30 Hz**: each tick it runs 2 sim steps, consuming the next buffered input per player per step (a missing input repeats the last one, which is flagged). It sends a snapshot every 3 sim steps (20 Hz). Both rates are configurable as divisors of 60. Tick-time metrics are recorded per match. Graceful drain: on SIGTERM, stop accepting new matches, let running ones finish (with a max time), then exit.
 
 ### Matchmaking split
 The slice keeps matchmaking inside `apps/api` as a module. It is extracted into `apps/matchmaking` only when its load or release cadence justifies it. The interface and the ticket protocol stay identical, so extraction is a deployment change, not a rewrite.
@@ -130,7 +132,7 @@ The slice keeps matchmaking inside `apps/api` as a module. It is extracted into 
 ## E. Multiplayer networking architecture
 
 ### Connection lifecycle
-1. Client opens `wss://<gs>/v1/play?ticket=…`. The host validates the ticket, nonce, expiry and protocol version (`Hello{protocolVersion, buildHash}`). A mismatch closes the socket with a typed reason.
+1. Client opens the worker URL from its ticket (`wss://<gs>/play/<slot>?ticket=…`). The match worker validates the ticket, nonce, expiry and protocol version (`Hello{protocolVersion, buildHash}`). A mismatch closes the socket with a typed reason.
 2. Worker sends `Welcome{entityId, tickRate, serverTick, mapId, matchConfig}`. Client loads the map, then sends `Ready`.
 3. Steady state: inputs up, snapshots down, reliable events both ways.
 4. **Heartbeat**: ping/pong every 1 s for RTT/jitter measurement. 5 s with no traffic = disconnect.
@@ -150,9 +152,10 @@ All schemas live in `@br/protocol`, versioned by a single `PROTOCOL_VERSION`. Ev
 `{seq, clientTick, moveX:int8, moveY:int8, yaw:uint16, pitch:int16, buttons:bitfield(fire, ads, sprint, crouch, prone, jump, reload, interact, leanL, leanR, …), weaponSlot}`. Movement is direction intent only. The server clamps and normalizes. Aim angles are quantized and the yaw delta per tick is rate-limited (anti-spin).
 
 ### Prediction & reconciliation (local player)
-- The client applies each `InputFrame` immediately through `game-core.stepPlayer()` (same Rapier deterministic build), stores `{seq, predictedState}` in a ring buffer.
+- The client applies each `InputFrame` immediately through `game-core.stepPlayer()` at dt = 1/60 s (same Rapier deterministic build) and stores `{seq, predictedState}` in a ring buffer.
+- **Prediction scope:** the local player's character controller is cast against **static world colliders only** (terrain, buildings). Other players, loot and vehicles are not in the client's prediction world. Player-to-player collisions resolve on the server, and the client absorbs them as ordinary corrections. No Rapier world snapshot or rollback is needed: replay only re-runs the kinematic controller.
 - Each snapshot includes `lastProcessedInputSeq` for this client. The client compares the authoritative state for that seq to its prediction. If it differs beyond an epsilon, it resets to the server state and replays the unacked inputs. Visual error is smoothed over ~100 ms so corrections don't snap the camera.
-- Only the local player and their own projectiles' muzzle effects are predicted. Damage, kills and inventory are never predicted beyond cosmetic feedback (e.g., the hit marker is shown **only on server confirmation**, sent within the next snapshot ~50 ms later).
+- Only the local player's movement and their own muzzle effects are predicted. Damage, kills and inventory are never predicted. The hit marker is shown **only on server confirmation**: a reliable `Hit` event sent in the server tick where the projectile connects (so its latency is flight time + one tick + RTT/2).
 
 ### Interpolation (everyone else)
 Remote entities render at `serverTime − interpDelay` (default 100 ms = 2 snapshots), interpolating between buffered snapshots. Extrapolation is capped at 250 ms on loss, then freeze.
@@ -166,7 +169,7 @@ Remote entities render at `serverTime − interpDelay` (default 100 ms = 2 snaps
 ### Bandwidth & interest management
 - Uniform grid (64 m cells). Each client receives full-rate updates for entities within ~300 m, reduced-rate (5 Hz) to ~1 km, and nothing beyond (except teammates, aircraft, zone). This also starves ESP cheats of data.
 - Snapshot encoding: quantized positions (1 cm in a 16 km cube with 21-bit axes), smallest-three quaternions, field-change bitmasks, delta vs last acked baseline, full keyframe on desync.
-- Budget: **≤ 40 kbps down / ≤ 16 kbps up per client at 8 players**; ≤ 150 kbps down at 100 players with interest management.
+- Budget (**payload only**, excluding TCP/IP + TLS + WebSocket framing, which adds roughly 19 kbps up at 30 packets/s): **≤ 40 kbps down / ≤ 16 kbps up per client at 8 players**; ≤ 150 kbps down at 100 players with interest management. On-the-wire totals are measured and reported alongside.
 
 ### Rate limiting
 Per connection: input packets ≤ 40/s, commands ≤ 20/s, events ≤ 5/s. Token buckets, and violations escalate drop → warn → kick.
@@ -358,8 +361,8 @@ Each budget gets a CI or scripted check: bundle size in CI, a scripted Playwrigh
 | 1 | **Scope.** A commercial BR is a multi-year studio effort. | Never shipping | Phased milestones with a hard vertical-slice definition. Features behind flags. Cut list kept per phase. |
 | 2 | **"Realistic graphics" with free assets** | Looks amateur | Art direction doc in Phase 6 picks a consistent CC0 asset family + photogrammetry textures (Poly Haven/ambientCG). Budget for commissioned hero assets (characters, weapons) later. |
 | 3 | WebGPURenderer WebGL2-backend performance | Low-end users excluded | Phase 3 spike, `RendererBackend` interface, fallback to `WebGLRenderer`. |
-| 4 | TCP head-of-line blocking on WebSocket | Rubber-banding under loss | Redundant inputs, delta snapshots, interpolation buffer. WebTransport behind `Transport` in Phase 8. |
-| 5 | Rapier determinism client↔server | Constant corrections | Use the deterministic build on both. Pin one version. Cross-runtime determinism test in CI (Node vs headless Chromium, same inputs → same hash). |
+| 4 | TCP head-of-line blocking on WebSocket | Stalls/rubber-banding under packet loss | Can't be fixed over WebSocket. Soften with small packets, `TCP_NODELAY`, a 100 ms interpolation buffer and capped extrapolation. Phase 5 chaos tests measure it, and WebTransport datagrams behind `Transport` are the real fix (Phase 8, pulled earlier if measurements demand). |
+| 5 | Prediction divergence client↔server | Constant corrections | Deterministic Rapier build on both, one pinned version. Prediction against static geometry only. Deterministic math module in game-core instead of `Math.sin/cos/pow`. Cross-runtime determinism test in CI (Node, Chromium, Firefox, WebKit: same inputs → same hash). |
 | 6 | Node GC pauses on server | Tick spikes | Worker per match, pooled/typed-array component stores, no per-tick allocations in hot paths, tick p99 monitored. |
 | 7 | Cheating | Ruins the game | Server authority (§H). Accept aimbots need detection plus moderation tooling. |
 | 8 | Hosting cost & latency at scale | Bad pings / burn | Regions only when there are players. Fleet autoscale. Direct-to-server WSS. |
@@ -373,7 +376,7 @@ Each budget gets a CI or scripted check: bundle size in CI, a scripted Playwrigh
 | Layer | Tooling | What |
 |---|---|---|
 | Unit | Vitest | game-core (movement, weapons, recoil, damage tables, inventory transactions, zone math, match FSM), protocol codecs (round-trip, fuzzed malformed input), config schema validation. ≥ 80% coverage gate on `game-core`, `protocol`, `api`. |
-| Determinism | Vitest + Playwright | Same input script in Node and Chromium → identical state hash after 10 k ticks. |
+| Determinism | Vitest + Playwright | Same input script in Node, Chromium, Firefox and WebKit → identical state hash after 10 k ticks. |
 | Integration | Vitest + Postgres service container + real WS | Auth/refresh rotation, queue → allocation → ticket → join, disconnect/reconnect, combat validation (forged/rapid/out-of-ammo fire rejected), results ingestion idempotency, malformed and duplicate messages, stale tickets. |
 | E2E | Playwright (multiple browser contexts against compose) | Guest login → lobby → queue → match → move → pick up → shoot → die → spectate → results. Two-real-client match. |
 | Network chaos | tc/netem in CI job or toxiproxy | Latency, jitter, loss, server restart, tab close. |
